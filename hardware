@@ -1,0 +1,99 @@
+// ESP32-WROOM INMP441 -> WebSocket streamer (16kHz, 16-bit mono)
+// Requires: WebSocketsClient library (install via Library Manager)
+
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include "driver/i2s.h"
+
+// ---------- WiFi ----------
+const char* ssid = "u";
+const char* password = "00000000";
+
+// ---------- Server ----------
+const char* ws_server = "172.27.45.188"; // e.g., "192.168.1.100"
+const uint16_t ws_port = 8080;
+const char* ws_path = "/ws";
+
+// ---------- I2S config ----------
+#define I2S_NUM           I2S_NUM_0
+#define SAMPLE_RATE       16000              // 16 kHz
+#define I2S_BCK_IO        26                 // SCK / BCLK
+#define I2S_WS_IO         22                 // WS / LRCLK
+#define I2S_DATA_IN_IO    21                 // SD (data in)
+
+WebSocketsClient webSocket;
+
+static const i2s_config_t i2s_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+  .sample_rate = SAMPLE_RATE,
+  .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // INMP441 provides data on one channel
+  .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+  .intr_alloc_flags = 0,
+  .dma_buf_count = 4,
+  .dma_buf_len = 1024,
+  .use_apll = false,
+  .tx_desc_auto_clear = false
+};
+
+static const i2s_pin_config_t pin_config = {
+  .bck_io_num = I2S_BCK_IO,
+  .ws_io_num = I2S_WS_IO,
+  .data_out_num = I2S_PIN_NO_CHANGE,
+  .data_in_num = I2S_DATA_IN_IO
+};
+
+void onWsEvent(WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    Serial.println("WS connected");
+  } else if (type == WStype_DISCONNECTED) {
+    Serial.println("WS disconnected");
+  } else if (type == WStype_TEXT) {
+    Serial.printf("WS text: %s\n", payload);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // Connect WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi connected, IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Install and configure I2S driver
+  i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM, &pin_config);
+
+  // WebSocket setup
+  webSocket.begin(ws_server, ws_port, ws_path);
+  webSocket.onEvent(onWsEvent);
+  webSocket.setReconnectInterval(5000);
+  Serial.println("Setup done");
+}
+
+void loop() {
+  webSocket.loop();
+
+  // Buffer to read samples (number of samples chosen to be a manageable chunk)
+  const int samplesToRead = 512;
+  int16_t i2sBuffer[samplesToRead];
+  size_t bytesRead = 0;
+
+  // Read from I2S (blocking)
+  esp_err_t res = i2s_read(I2S_NUM, (void*)i2sBuffer, sizeof(i2sBuffer), &bytesRead, portMAX_DELAY);
+  if (res == ESP_OK && bytesRead > 0) {
+    if (webSocket.isConnected()) {
+      webSocket.sendBIN((uint8_t*)i2sBuffer, bytesRead);
+    }
+  } else if (res != ESP_OK) {
+    Serial.printf("I2S read error: %d\n", res);
+  }
+}
